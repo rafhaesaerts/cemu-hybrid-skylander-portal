@@ -1,4 +1,8 @@
 > ## 🛡️ Hybrid Skylanders Portal fork
+> 🍴 **A fork of [cemu-project/Cemu](https://github.com/cemu-project/Cemu)** — all credit for Cemu
+> goes to its authors; this fork only adds hybrid Skylanders Portal support (licensed MPL‑2.0, same
+> as Cemu).
+>
 > This fork lets you use a **real Skylanders Portal of Power together with the emulated one** —
 > physical figures and virtual (dump) figures appear in the game at the same time.
 > **➡️ See [INSTALL.md](INSTALL.md) for the easy step‑by‑step setup guide.**
