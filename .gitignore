@@ -60,3 +60,6 @@ build_s/
 build.status
 build_only.status
 build_only.log
+
+# Release packaging output
+dist/
