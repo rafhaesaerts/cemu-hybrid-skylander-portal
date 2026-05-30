@@ -31,7 +31,7 @@ physical portal and virtual figures you load from dumps all show up together in 
 
 **Option B — Build it yourself (advanced)**
 1. `git clone https://github.com/rafhaesaerts/cemu-hybrid-skylander-portal.git`
-2. Follow Cemu's standard [build instructions](BUILDING.md) for your OS.
+2. Follow Cemu's standard [build instructions](BUILD.md) for your OS.
    The hybrid changes are already in the `hybrid-portal` branch — nothing extra to do.
 
 > 💡 Your normal Cemu and this one don't interfere. You can keep both.
