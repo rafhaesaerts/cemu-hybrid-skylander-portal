@@ -1,7 +1,17 @@
 #include "BackendLibusb.h"
 
+#include "config/CemuConfig.h"
+
 namespace nsyshid::backend::libusb
 {
+	// Skylander hybrid mode opens the real portal (1430:0150) itself via
+	// PhysicalPortalBridge, so the libusb backend must not also grab it as a raw
+	// passthrough device (that would race two owners on one device, §3.2).
+	static bool IsClaimedByHybridPortal(uint16 vendorId, uint16 productId)
+	{
+		return GetConfig().emulated_usb_devices.emulate_skylander_portal_hybrid &&
+			   vendorId == 0x1430 && productId == 0x0150;
+	}
 	BackendLibusb::BackendLibusb()
 		: m_ctx(nullptr),
 		  m_initReturnCode(0),
@@ -88,7 +98,12 @@ namespace nsyshid::backend::libusb
 			{
 				if (IsDeviceWhitelisted(device->m_vendorId, device->m_productId))
 				{
-					if (!AttachDevice(device))
+					if (IsClaimedByHybridPortal(device->m_vendorId, device->m_productId))
+					{
+						cemuLog_logDebug(LogType::Force,
+										 "nsyshid::BackendLibusb: skipping 1430:0150 (Skylander hybrid mode)");
+					}
+					else if (!AttachDevice(device))
 					{
 						cemuLog_log(LogType::Force,
 									"nsyshid::BackendLibusb: failed to attach device: {:04x}:{:04x}",
@@ -144,7 +159,12 @@ namespace nsyshid::backend::libusb
 			{
 				if (IsDeviceWhitelisted(device->m_vendorId, device->m_productId))
 				{
-					if (!AttachDevice(device))
+					if (IsClaimedByHybridPortal(device->m_vendorId, device->m_productId))
+					{
+						cemuLog_logDebug(LogType::Force,
+										 "nsyshid::BackendLibusb::OnHotplug(): skipping 1430:0150 (Skylander hybrid mode)");
+					}
+					else if (!AttachDevice(device))
 					{
 						cemuLog_log(LogType::Force,
 									"nsyshid::BackendLibusb::OnHotplug(): failed to attach device: {:04x}:{:04x}",

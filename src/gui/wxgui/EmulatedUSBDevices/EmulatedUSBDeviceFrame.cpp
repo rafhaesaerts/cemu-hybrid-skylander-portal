@@ -76,6 +76,26 @@ wxPanel* EmulatedUSBDeviceFrame::AddSkylanderPage(wxNotebook* notebook)
 		GetConfigHandle().Save();
 	});
 	row->Add(m_emulatePortal, 1, wxEXPAND | wxALL, 2);
+
+	// Hybrid: also read figures from a real Portal of Power and merge them with the
+	// virtual ones below. Takes effect on the next game load / backend re-attach.
+	m_emulatePortalHybrid =
+		new wxCheckBox(box, wxID_ANY, _("Hybrid (also use real portal)"));
+	m_emulatePortalHybrid->SetValue(
+		GetConfig().emulated_usb_devices.emulate_skylander_portal_hybrid);
+	m_emulatePortalHybrid->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) {
+		const bool enabled = m_emulatePortalHybrid->IsChecked();
+		GetConfig().emulated_usb_devices.emulate_skylander_portal_hybrid = enabled;
+		GetConfigHandle().Save();
+		// Start/stop the real-portal bridge live so toggling works mid-session without a
+		// relaunch. StartHybrid is a no-op if libusb is unavailable or no real portal is found.
+		if (enabled)
+			nsyshid::g_skyportal.StartHybrid();
+		else
+			nsyshid::g_skyportal.StopHybrid();
+	});
+	row->Add(m_emulatePortalHybrid, 1, wxEXPAND | wxALL, 2);
+
 	boxSizer->Add(row, 1, wxEXPAND | wxALL, 2);
 	for (int i = 0; i < nsyshid::MAX_SKYLANDERS; i++)
 	{

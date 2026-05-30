@@ -532,6 +532,8 @@ struct CemuConfig
 	struct
 	{
 		ConfigValue<bool> emulate_skylander_portal{false};
+		// Hybrid: merge a real Portal of Power's figures with the emulated/virtual ones.
+		ConfigValue<bool> emulate_skylander_portal_hybrid{false};
 		ConfigValue<bool> emulate_infinity_base{false};
 		ConfigValue<bool> emulate_dimensions_toypad{false};
 	}emulated_usb_devices{};

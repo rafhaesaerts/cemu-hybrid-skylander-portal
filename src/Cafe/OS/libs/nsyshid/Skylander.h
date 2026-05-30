@@ -1,9 +1,11 @@
 #pragma once
 
+#include <memory>
 #include <mutex>
 
 #include "nsyshid.h"
 #include "Backend.h"
+#include "PhysicalPortalBridge.h"
 
 #include "Common/FileStream.h"
 
@@ -56,6 +58,10 @@ namespace nsyshid
 			std::queue<uint8> queuedStatus;
 			std::array<uint8, SKY_FIGURE_SIZE> data{};
 			uint32 lastId = 0;
+			// Hybrid mode: a slot backed by a figure on the REAL portal rather than a dump
+			// file. portalIndex is the real portal's slot index for forwarding writes.
+			bool physical = false;
+			uint8 portalIndex = 0;
 			void Save();
 
 			enum : uint8
@@ -92,6 +98,15 @@ namespace nsyshid
 		static std::map<const std::pair<const uint16, const uint16>, const char*> GetListSkylanders();
 		std::string FindSkylander(uint16 skyId, uint16 skyVar);
 
+		// Hybrid mode: merge a real Portal of Power's figures into these emulated slots.
+		// StartHybrid opens the bridge; if no real portal / no libusb it is a no-op and the
+		// portal stays purely emulated. OnPhysicalAdd/Remove are invoked by the bridge.
+		void StartHybrid();
+		void StopHybrid();
+		bool IsHybridActive() const { return m_bridge != nullptr; }
+		void OnPhysicalAdd(uint8 portalIndex, const std::array<uint8, SKY_FIGURE_SIZE>& data);
+		void OnPhysicalRemove(uint8 portalIndex);
+
 	  protected:
 		std::mutex m_skyMutex;
 		std::mutex m_queryMutex;
@@ -104,6 +119,7 @@ namespace nsyshid
 		SkylanderLEDColor m_colorRight = {};
 		SkylanderLEDColor m_colorLeft = {};
 		SkylanderLEDColor m_colorTrap = {};
+		std::unique_ptr<PhysicalPortalBridge> m_bridge;
 	};
 	extern SkylanderUSB g_skyportal;
 } // namespace nsyshid

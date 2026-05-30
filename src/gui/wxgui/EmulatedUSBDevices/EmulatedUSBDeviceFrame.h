@@ -26,6 +26,7 @@ class EmulatedUSBDeviceFrame : public wxFrame
 
   private:
 	wxCheckBox* m_emulatePortal;
+	wxCheckBox* m_emulatePortalHybrid;
 	wxCheckBox* m_emulateBase;
 	wxCheckBox* m_emulateToypad;
 	std::array<wxTextCtrl*, nsyshid::MAX_SKYLANDERS> m_skylanderSlots;

@@ -54,3 +54,9 @@ bin/graphicPacks/*
 
 # Ignore Finder view option files created by OS X
 .DS_Store
+# Hybrid portal local build/scratch artifacts
+build_r/
+build_s/
+build.status
+build_only.status
+build_only.log

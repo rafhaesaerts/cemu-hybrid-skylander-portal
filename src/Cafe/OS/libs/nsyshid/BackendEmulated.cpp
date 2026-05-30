@@ -22,12 +22,21 @@ namespace nsyshid::backend::emulated
 
 	void BackendEmulated::AttachVisibleDevices()
 	{
-		if (GetConfig().emulated_usb_devices.emulate_skylander_portal && !FindDeviceById(0x1430, 0x0150))
+		const auto& usbConfig = GetConfig().emulated_usb_devices;
+		if ((usbConfig.emulate_skylander_portal || usbConfig.emulate_skylander_portal_hybrid) &&
+			!FindDeviceById(0x1430, 0x0150))
 		{
 			cemuLog_logDebug(LogType::Force, "Attaching Emulated Portal");
 			// Add Skylander Portal
 			auto device = std::make_shared<SkylanderPortalDevice>();
 			AttachDevice(device);
+			if (usbConfig.emulate_skylander_portal_hybrid)
+			{
+				// Hybrid: also open the real portal so physical figures merge into the slots.
+				// (BackendLibusb is told to skip 1430:0150 so the bridge owns it exclusively.)
+				cemuLog_logDebug(LogType::Force, "Skylander hybrid mode: connecting to real portal");
+				g_skyportal.StartHybrid();
+			}
 		}
 	#ifdef HAS_LIBUSB
 		else if (auto usb_portal = FindDeviceById(0x1430, 0x1F17))

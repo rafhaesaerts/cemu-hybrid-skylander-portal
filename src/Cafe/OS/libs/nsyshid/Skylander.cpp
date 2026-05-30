@@ -682,11 +682,16 @@ namespace nsyshid
 		case 'C':
 		{
 			g_skyportal.SetLeds(0x01, buf[1], buf[2], buf[3]);
+			// Hybrid: mirror the LED command onto the real portal verbatim.
+			if (m_bridge)
+				m_bridge->QueueCommand(buf, length);
 			break;
 		}
 		case 'J':
 		{
 			g_skyportal.SetLeds(buf[1], buf[2], buf[3], buf[4]);
+			if (m_bridge)
+				m_bridge->QueueCommand(buf, length);
 			interruptResponse = {buf[0]};
 			break;
 		}
@@ -698,6 +703,8 @@ namespace nsyshid
 				side = 0x04;
 			}
 			g_skyportal.SetLeds(side, buf[2], buf[3], buf[4]);
+			if (m_bridge)
+				m_bridge->QueueCommand(buf, length);
 			break;
 		}
 		case 'M':
@@ -952,7 +959,16 @@ namespace nsyshid
 		{
 			replyBuf[1] = (0x10 | skyNum);
 			memcpy(skylander.data.data() + (block * 16), toWriteBuf, 16);
-			skylander.Save();
+			if (skylander.physical)
+			{
+				// Hybrid: forward the write to the real portal (no dump file to Save()).
+				if (m_bridge)
+					m_bridge->QueueWrite(skylander.portalIndex, block, toWriteBuf);
+			}
+			else
+			{
+				skylander.Save();
+			}
 		}
 		else
 		{
@@ -1027,5 +1043,102 @@ namespace nsyshid
 
 		skyFile->SetPosition(0);
 		skyFile->writeData(data.data(), data.size());
+	}
+
+	// ---------------------------------------------------------------------------------
+	// Hybrid mode (real Portal of Power merged into the emulated slots)
+	// ---------------------------------------------------------------------------------
+
+	void SkylanderUSB::StartHybrid()
+	{
+		if (m_bridge)
+			return;
+		cemuLog_log(LogType::Force, "nsyshid::Skylander: StartHybrid - opening real portal");
+		m_bridge = std::make_unique<PhysicalPortalBridge>();
+		m_bridge->SetCallbacks(
+			[this](uint8 portalIndex, const std::array<uint8, SKY_FIGURE_SIZE>& data) {
+				OnPhysicalAdd(portalIndex, data);
+			},
+			[this](uint8 portalIndex) { OnPhysicalRemove(portalIndex); });
+		if (!m_bridge->Start())
+		{
+			// No real portal connected / libusb unavailable -> remain purely emulated.
+			cemuLog_log(LogType::Force,
+							 "nsyshid::Skylander: StartHybrid FAILED - real portal could not be opened "
+							 "(check it is plugged in and bound to WinUSB via Zadig)");
+			m_bridge.reset();
+		}
+		else
+		{
+			cemuLog_log(LogType::Force, "nsyshid::Skylander: StartHybrid OK - bridge running");
+			// Immediately reflect the game's current LED colour so the real portal matches the
+			// emulated one on connect (rather than flashing a default colour).
+			m_bridge->SetColor(m_colorRight.red, m_colorRight.green, m_colorRight.blue);
+		}
+	}
+
+	void SkylanderUSB::StopHybrid()
+	{
+		if (m_bridge)
+		{
+			m_bridge->Stop();
+			m_bridge.reset();
+		}
+	}
+
+	void SkylanderUSB::OnPhysicalAdd(uint8 portalIndex,
+									 const std::array<uint8, SKY_FIGURE_SIZE>& data)
+	{
+		std::lock_guard lock(m_skyMutex);
+
+		// Ignore if this physical figure is already mapped to a present slot.
+		for (auto& s : m_skylanders)
+		{
+			if (s.physical && s.portalIndex == portalIndex && (s.status & 1))
+				return;
+		}
+
+		// Pick the lowest free slot (mirrors LoadSkylander's spot-retaining behaviour).
+		uint8 foundSlot = 0xFF;
+		for (uint8 i = 0; i < MAX_SKYLANDERS; i++)
+		{
+			if ((m_skylanders[i].status & 1) == 0 && i < foundSlot)
+				foundSlot = i;
+		}
+		if (foundSlot == 0xFF)
+			return; // portal full
+
+		auto& sky = m_skylanders[foundSlot];
+		memcpy(sky.data.data(), data.data(), sky.data.size());
+		sky.skyFile.reset(); // physical figures are not backed by a dump file
+		sky.physical = true;
+		sky.portalIndex = portalIndex;
+		sky.status = Skylander::ADDED;
+		sky.queuedStatus.push(Skylander::ADDED);
+		sky.queuedStatus.push(Skylander::READY);
+
+		uint32 serial = 0;
+		for (int i = 3; i >= 0; i--)
+		{
+			serial <<= 8;
+			serial |= sky.data[i];
+		}
+		sky.lastId = serial;
+	}
+
+	void SkylanderUSB::OnPhysicalRemove(uint8 portalIndex)
+	{
+		std::lock_guard lock(m_skyMutex);
+		for (auto& s : m_skylanders)
+		{
+			if (s.physical && s.portalIndex == portalIndex && (s.status & 1))
+			{
+				s.status = Skylander::REMOVING;
+				s.queuedStatus.push(Skylander::REMOVING);
+				s.queuedStatus.push(Skylander::REMOVED);
+				s.physical = false; // free the slot once the removal animation drains
+				return;
+			}
+		}
 	}
 } // namespace nsyshid
