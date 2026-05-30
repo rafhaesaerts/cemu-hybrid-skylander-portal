@@ -1,3 +1,11 @@
+> ## 🛡️ Hybrid Skylanders Portal fork
+> This fork lets you use a **real Skylanders Portal of Power together with the emulated one** —
+> physical figures and virtual (dump) figures appear in the game at the same time.
+> **➡️ See [INSTALL.md](INSTALL.md) for the easy step‑by‑step setup guide.**
+> Technical details in [HYBRID_PORTAL_INTEGRATION.md](HYBRID_PORTAL_INTEGRATION.md).
+
+---
+
 # **Cemu - Wii U emulator**
 
 [![Build Process](https://github.com/cemu-project/Cemu/actions/workflows/build.yml/badge.svg)](https://github.com/cemu-project/Cemu/actions/workflows/build.yml)
