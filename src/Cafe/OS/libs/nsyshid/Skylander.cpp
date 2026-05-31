@@ -857,11 +857,14 @@ namespace nsyshid
 			auto& skylander = m_skylanders[foundSlot];
 			memcpy(skylander.data.data(), buf, skylander.data.size());
 			skylander.skyFile = std::move(file);
+			skylander.physical = false; // virtual figure (GUI / dump-backed)
 			skylander.status = Skylander::ADDED;
 			skylander.queuedStatus.push(Skylander::ADDED);
 			skylander.queuedStatus.push(Skylander::READY);
 			skylander.lastId = skySerial;
 		}
+		cemuLog_log(LogType::Force, "nsyshid::Skylander: LoadSkylander (virtual) -> slot {} (id {:08X})",
+					foundSlot, skySerial);
 		return foundSlot;
 	}
 
@@ -877,9 +880,11 @@ namespace nsyshid
 			thesky.queuedStatus.push(0);
 			thesky.Save();
 			thesky.skyFile.reset();
+			cemuLog_log(LogType::Force, "nsyshid::Skylander: RemoveSkylander (virtual) -> slot {}", skyNum);
 			return true;
 		}
 
+		cemuLog_log(LogType::Force, "nsyshid::Skylander: RemoveSkylander -> slot {} was not present", skyNum);
 		return false;
 	}
 
@@ -1138,12 +1143,26 @@ namespace nsyshid
 			}
 		}
 
-		// Pick the lowest free slot (mirrors LoadSkylander's spot-retaining behaviour).
+		// Mirror real hardware: a figure on physical position `portalIndex` maps to the SAME
+		// emulated slot, so physical figures stay in the low, contiguous slots the game expects
+		// (the game does not reliably register a figure added to a low slot while another sits on a
+		// far-away high slot). Only if that slot is already taken by a virtual (GUI) figure do we
+		// fall back to the lowest free slot.
 		uint8 foundSlot = 0xFF;
-		for (uint8 i = 0; i < MAX_SKYLANDERS; i++)
+		if (portalIndex < MAX_SKYLANDERS && (m_skylanders[portalIndex].status & 1) == 0)
 		{
-			if ((m_skylanders[i].status & 1) == 0 && i < foundSlot)
-				foundSlot = i;
+			foundSlot = portalIndex;
+		}
+		else
+		{
+			for (uint8 i = 0; i < MAX_SKYLANDERS; i++)
+			{
+				if ((m_skylanders[i].status & 1) == 0)
+				{
+					foundSlot = i;
+					break;
+				}
+			}
 		}
 		if (foundSlot == 0xFF)
 		{
