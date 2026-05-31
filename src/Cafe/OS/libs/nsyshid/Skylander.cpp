@@ -862,9 +862,50 @@ namespace nsyshid
 			skylander.queuedStatus.push(Skylander::ADDED);
 			skylander.queuedStatus.push(Skylander::READY);
 			skylander.lastId = skySerial;
+
+			// The game ignores a figure that APPEARS mid-session while another figure is already
+			// active (it defers a new arrival as a possible Player 2 and never reads that slot).
+			// Placing a trap/item alongside a live character therefore goes unnoticed. Replicate the
+			// "lift the figure and put it back" trick that forces a full portal re-scan: briefly pulse
+			// every OTHER present figure off-and-on. When those slots re-appear the game re-reads the
+			// whole portal and finds the newly loaded item (which stays present throughout).
+			bool othersPresent = false;
+			for (uint8 i = 0; i < 16; i++)
+			{
+				if (i == foundSlot)
+					continue;
+				if (m_skylanders[i].status & 1)
+				{
+					othersPresent = true;
+					break;
+				}
+			}
+			if (othersPresent)
+			{
+				constexpr int kRemoveHold = 150; // poll samples to hold "absent" (~1.5-2s, matches a manual lift)
+				for (uint8 i = 0; i < 16; i++)
+				{
+					if (i == foundSlot)
+						continue;
+					auto& other = m_skylanders[i];
+					if (!(other.status & 1))
+						continue;
+					other.status = Skylander::REMOVING;
+					other.queuedStatus.push(Skylander::REMOVING);
+					for (int h = 0; h < kRemoveHold; h++)
+						other.queuedStatus.push(Skylander::REMOVED);
+					other.queuedStatus.push(Skylander::ADDED);
+					other.queuedStatus.push(Skylander::READY);
+				}
+				cemuLog_log(LogType::Force,
+							"nsyshid::Skylander: LoadSkylander -> portal re-scan pulse (others present)");
+			}
 		}
-		cemuLog_log(LogType::Force, "nsyshid::Skylander: LoadSkylander (virtual) -> slot {} (id {:08X})",
-					foundSlot, skySerial);
+		uint16 skyType = (uint16)buf[0x10] | ((uint16)buf[0x11] << 8);
+		uint16 skyVariant = (uint16)buf[0x1C] | ((uint16)buf[0x1D] << 8);
+		cemuLog_log(LogType::Force,
+					"nsyshid::Skylander: LoadSkylander (virtual) -> slot {} (id {:08X}) type {} var {:04X}",
+					foundSlot, skySerial, skyType, skyVariant);
 		return foundSlot;
 	}
 
