@@ -1015,6 +1015,15 @@ namespace nsyshid
 								 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 								 0x00, 0x00};
 			memcpy(&interruptResponse[1], &status, sizeof(status));
+
+			// Diagnostic: log the status WORD the game receives, but only when it changes.
+			static uint32 s_lastWord = 0xFFFFFFFFu;
+			if (status != s_lastWord)
+			{
+				s_lastWord = status;
+				cemuLog_log(LogType::Force,
+							"nsyshid::Skylander: GetStatus word -> {:08X} (active={})", status, active);
+			}
 		}
 		return interruptResponse;
 	}
@@ -1091,11 +1100,42 @@ namespace nsyshid
 	{
 		std::lock_guard lock(m_skyMutex);
 
-		// Ignore if this physical figure is already mapped to a present slot.
-		for (auto& s : m_skylanders)
+		uint32 serial = 0;
+		for (int i = 3; i >= 0; i--)
 		{
-			if (s.physical && s.portalIndex == portalIndex && (s.status & 1))
+			serial <<= 8;
+			serial |= data[i];
+		}
+
+		// If this physical portal slot is already mapped to an emulated slot, update it
+		// IN PLACE. A figure can be swapped on the same portal zone without a clean removal
+		// in between, so do not blindly ignore it - only ignore the EXACT same figure.
+		for (uint8 i = 0; i < MAX_SKYLANDERS; i++)
+		{
+			auto& s = m_skylanders[i];
+			if (s.physical && s.portalIndex == portalIndex)
+			{
+				if ((s.status & 1) && s.lastId == serial)
+				{
+					cemuLog_log(LogType::Force,
+								"nsyshid::Skylander: OnPhysicalAdd portal {} -> slot {} unchanged (id {:08X})",
+								portalIndex, i, serial);
+					return;
+				}
+				// Different figure on the same zone: reload, forcing a remove+add cycle so the
+				// game re-reads the new figure.
+				memcpy(s.data.data(), data.data(), s.data.size());
+				s.skyFile.reset();
+				s.lastId = serial;
+				s.status = Skylander::ADDED;
+				s.queuedStatus.push(Skylander::REMOVED);
+				s.queuedStatus.push(Skylander::ADDED);
+				s.queuedStatus.push(Skylander::READY);
+				cemuLog_log(LogType::Force,
+							"nsyshid::Skylander: OnPhysicalAdd portal {} -> slot {} REPLACED (id {:08X})",
+							portalIndex, i, serial);
 				return;
+			}
 		}
 
 		// Pick the lowest free slot (mirrors LoadSkylander's spot-retaining behaviour).
@@ -1106,39 +1146,47 @@ namespace nsyshid
 				foundSlot = i;
 		}
 		if (foundSlot == 0xFF)
+		{
+			cemuLog_log(LogType::Force,
+						"nsyshid::Skylander: OnPhysicalAdd portal {} -> NO FREE SLOT (id {:08X})",
+						portalIndex, serial);
 			return; // portal full
+		}
 
 		auto& sky = m_skylanders[foundSlot];
 		memcpy(sky.data.data(), data.data(), sky.data.size());
 		sky.skyFile.reset(); // physical figures are not backed by a dump file
 		sky.physical = true;
 		sky.portalIndex = portalIndex;
+		sky.lastId = serial;
 		sky.status = Skylander::ADDED;
 		sky.queuedStatus.push(Skylander::ADDED);
 		sky.queuedStatus.push(Skylander::READY);
 
-		uint32 serial = 0;
-		for (int i = 3; i >= 0; i--)
-		{
-			serial <<= 8;
-			serial |= sky.data[i];
-		}
-		sky.lastId = serial;
+		cemuLog_log(LogType::Force,
+					"nsyshid::Skylander: OnPhysicalAdd portal {} -> slot {} ADDED (id {:08X})",
+					portalIndex, foundSlot, serial);
 	}
 
 	void SkylanderUSB::OnPhysicalRemove(uint8 portalIndex)
 	{
 		std::lock_guard lock(m_skyMutex);
-		for (auto& s : m_skylanders)
+		for (uint8 i = 0; i < MAX_SKYLANDERS; i++)
 		{
+			auto& s = m_skylanders[i];
 			if (s.physical && s.portalIndex == portalIndex && (s.status & 1))
 			{
 				s.status = Skylander::REMOVING;
 				s.queuedStatus.push(Skylander::REMOVING);
 				s.queuedStatus.push(Skylander::REMOVED);
 				s.physical = false; // free the slot once the removal animation drains
+				cemuLog_log(LogType::Force,
+							"nsyshid::Skylander: OnPhysicalRemove portal {} -> slot {} REMOVING",
+							portalIndex, i);
 				return;
 			}
 		}
+		cemuLog_log(LogType::Force,
+					"nsyshid::Skylander: OnPhysicalRemove portal {} -> no matching slot", portalIndex);
 	}
 } // namespace nsyshid
