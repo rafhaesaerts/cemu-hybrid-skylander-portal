@@ -101,6 +101,9 @@ namespace nsyshid
 		std::array<bool, 16> m_caching{};
 		std::array<std::array<uint8, FIGURE_SIZE>, 16> m_cacheData{};
 		std::array<std::array<bool, BLOCK_COUNT>, 16> m_cacheGot{};
+		// When caching of a slot began (ms). Bounds the whole-figure read so a block that the
+		// portal keeps reporting "present but not readable" can never spin forever.
+		std::array<uint64, 16> m_cacheStartMs{};
 
 		// The real portal drops commands sent back-to-back, so block reads are paced: at most
 		// ONE outstanding 'Q' query at a time, only advancing once its reply arrives (or it

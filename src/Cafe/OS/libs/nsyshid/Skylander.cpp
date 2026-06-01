@@ -865,22 +865,31 @@ namespace nsyshid
 
 			// The game ignores a figure that APPEARS mid-session while another figure is already
 			// active (it defers a new arrival as a possible Player 2 and never reads that slot).
-			// Placing a trap/item alongside a live character therefore goes unnoticed. Replicate the
-			// "lift the figure and put it back" trick that forces a full portal re-scan: briefly pulse
-			// every OTHER present figure off-and-on. When those slots re-appear the game re-reads the
-			// whole portal and finds the newly loaded item (which stays present throughout).
-			bool othersPresent = false;
+			// Placing a trap/item alongside a live PHYSICAL character therefore goes unnoticed.
+			// Replicate the "lift the figure and put it back" trick that forces a full portal
+			// re-scan: briefly pulse the present PHYSICAL figure(s) off-and-on. When those slots
+			// re-appear the game re-reads the whole portal and finds the newly loaded item.
+			//
+			// The pulse fires ONLY when this is the FIRST virtual figure loaded onto a portal that
+			// already holds a physical figure (the emulated/virtual side was empty). Once any virtual
+			// figure is already present, further loads/swaps must NOT disturb the portal - the user
+			// wants it to stay stable once something virtual is on it. Clearing never pulses either
+			// (RemoveSkylander touches only its own slot). So the only thing that resets the portal
+			// is loading into an otherwise-empty emulated portal while a physical figure is on it.
+			bool physicalPresent = false;
+			bool otherVirtualPresent = false;
 			for (uint8 i = 0; i < 16; i++)
 			{
 				if (i == foundSlot)
 					continue;
-				if (m_skylanders[i].status & 1)
-				{
-					othersPresent = true;
-					break;
-				}
+				if (!(m_skylanders[i].status & 1))
+					continue;
+				if (m_skylanders[i].physical)
+					physicalPresent = true;
+				else
+					otherVirtualPresent = true;
 			}
-			if (othersPresent)
+			if (physicalPresent && !otherVirtualPresent)
 			{
 				constexpr int kRemoveHold = 150; // poll samples to hold "absent" (~1.5-2s, matches a manual lift)
 				for (uint8 i = 0; i < 16; i++)
@@ -888,7 +897,7 @@ namespace nsyshid
 					if (i == foundSlot)
 						continue;
 					auto& other = m_skylanders[i];
-					if (!(other.status & 1))
+					if (!(other.status & 1) || !other.physical)
 						continue;
 					other.status = Skylander::REMOVING;
 					other.queuedStatus.push(Skylander::REMOVING);
@@ -898,7 +907,7 @@ namespace nsyshid
 					other.queuedStatus.push(Skylander::READY);
 				}
 				cemuLog_log(LogType::Force,
-							"nsyshid::Skylander: LoadSkylander -> portal re-scan pulse (others present)");
+							"nsyshid::Skylander: LoadSkylander -> portal re-scan pulse (first virtual onto physical)");
 			}
 		}
 		uint16 skyType = (uint16)buf[0x10] | ((uint16)buf[0x11] << 8);

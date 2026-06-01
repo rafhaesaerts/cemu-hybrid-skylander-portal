@@ -29,6 +29,7 @@ namespace nsyshid
 		constexpr uint32 PACKET_SIZE = 32; // Skylander command/response packet size
 		constexpr uint8 CACHE_MAX_RETRIES = 3;
 		constexpr uint64 QUERY_TIMEOUT_MS = 250; // wait this long for a block-read reply before retrying
+		constexpr uint64 CACHE_MAX_MS = 6000;    // give up reading a whole figure after this long
 		constexpr uint64 HANDSHAKE_PACE_MS = 60; // gap between paced startup commands
 
 		// Render up to `len` bytes of `buf` as a hex string for diagnostic logging.
@@ -341,6 +342,25 @@ namespace nsyshid
 			}
 		}
 
+		// 4b. Bound the whole-figure read. A block can be answered "present but not readable"
+		//     indefinitely (figure half-on the portal, damaged tag, etc.); the per-block timeout
+		//     never fires in that case because replies keep arriving. Abort once the figure has
+		//     been caching too long; the next status push restarts the read cleanly.
+		for (uint8 p = 0; p < 16; p++)
+		{
+			if (!m_caching[p])
+				continue;
+			if (NowMs() - m_cacheStartMs[p] > CACHE_MAX_MS)
+			{
+				m_caching[p] = false;
+				if (m_queryActive && m_querySlot == p)
+					m_queryActive = false;
+				cemuLog_log(LogType::Force,
+							"nsyshid::PhysicalPortalBridge: figure {} read timed out after {}ms - aborted",
+							p, CACHE_MAX_MS);
+			}
+		}
+
 		// 5. Deliver any figure whose blocks are now all cached.
 		for (uint8 p = 0; p < 16; p++)
 		{
@@ -432,6 +452,7 @@ namespace nsyshid
 					m_caching[p] = true;
 					m_cacheGot[p].fill(false);
 					m_cacheData[p].fill(0);
+					m_cacheStartMs[p] = NowMs();
 					cemuLog_log(LogType::Force, "nsyshid::PhysicalPortalBridge: figure arrived on slot {} - reading", p);
 				}
 			}
@@ -466,12 +487,15 @@ namespace nsyshid
 		if (!m_caching[p])
 			return;
 		// 0x10 in the index byte means the read succeeded (figure present & block returned).
-		// If it is missing, the figure was not readable yet - leave the block un-got and let the
-		// paced retry try again rather than caching empty data.
+		// If it is missing, the figure is present but not readable YET - normal while a figure
+		// is still settling onto the portal. Leave the block un-got and clear m_queryActive so
+		// Step() re-issues it promptly (each re-issue is naturally ~10ms-paced by ReadInterrupt,
+		// so this is fast without flooding). The whole-figure CACHE_MAX_MS guard in Step() bounds
+		// this so it can never spin forever on a block that never becomes readable.
 		if ((idxByte & 0x10) == 0)
 		{
 			if (m_queryActive && m_querySlot == p && m_queryBlock == block)
-				m_queryActive = false; // allow re-issue
+				m_queryActive = false; // allow prompt re-issue
 			return;
 		}
 		memcpy(m_cacheData[p].data() + (block * BLOCK_SIZE), &buf[3], BLOCK_SIZE);
