@@ -8,6 +8,7 @@
 #include "Common/FileStream.h"
 #include "audio/IAudioAPI.h"
 #include "config/CemuConfig.h"
+#include "Cafe/CafeSystem.h"
 
 namespace nsyshid
 {
@@ -889,23 +890,22 @@ namespace nsyshid
 				else
 					otherVirtualPresent = true;
 			}
-			if (physicalPresent && !otherVirtualPresent)
+			// Swap Force defers ANY figure (physical or virtual) that arrives mid-session, so a
+			// virtual character loaded while another figure is active goes unread until a re-scan.
+			// For Swap Force, pulse whenever another figure is present; for other games keep the
+			// narrow Trap Team behavior (first virtual onto a physical only).
+			if (IsSwapForce())
 			{
-				constexpr int kRemoveHold = 150; // poll samples to hold "absent" (~1.5-2s, matches a manual lift)
-				for (uint8 i = 0; i < 16; i++)
+				if (physicalPresent || otherVirtualPresent)
 				{
-					if (i == foundSlot)
-						continue;
-					auto& other = m_skylanders[i];
-					if (!(other.status & 1) || !other.physical)
-						continue;
-					other.status = Skylander::REMOVING;
-					other.queuedStatus.push(Skylander::REMOVING);
-					for (int h = 0; h < kRemoveHold; h++)
-						other.queuedStatus.push(Skylander::REMOVED);
-					other.queuedStatus.push(Skylander::ADDED);
-					other.queuedStatus.push(Skylander::READY);
+					PulseRescan(foundSlot, /*physicalOnly=*/false);
+					cemuLog_log(LogType::Force,
+								"nsyshid::Skylander: LoadSkylander -> portal re-scan pulse (Swap Force virtual load)");
 				}
+			}
+			else if (physicalPresent && !otherVirtualPresent)
+			{
+				PulseRescan(foundSlot, /*physicalOnly=*/true);
 				cemuLog_log(LogType::Force,
 							"nsyshid::Skylander: LoadSkylander -> portal re-scan pulse (first virtual onto physical)");
 			}
@@ -1189,6 +1189,15 @@ namespace nsyshid
 				cemuLog_log(LogType::Force,
 							"nsyshid::Skylander: OnPhysicalAdd portal {} -> slot {} REPLACED (id {:08X})",
 							portalIndex, i, serial);
+				// Swap Force ignores a figure that changes/arrives mid-session unless the whole
+				// portal is re-scanned. If another figure is already present, pulse it so the game
+				// re-reads the swapped figure.
+				if (IsSwapForce() && OtherPresent(i))
+				{
+					PulseRescan(i, /*physicalOnly=*/false);
+					cemuLog_log(LogType::Force,
+								"nsyshid::Skylander: OnPhysicalAdd -> portal re-scan pulse (Swap Force physical swap)");
+				}
 				return;
 			}
 		}
@@ -1235,6 +1244,17 @@ namespace nsyshid
 		cemuLog_log(LogType::Force,
 					"nsyshid::Skylander: OnPhysicalAdd portal {} -> slot {} ADDED (id {:08X})",
 					portalIndex, foundSlot, serial);
+
+		// Swap Force defers a figure that arrives mid-session (while a character is already
+		// active) and never queries that slot until a full portal re-scan. If another figure is
+		// already present, pulse it so the game re-reads the portal and finds this new physical
+		// figure. A lone first arrival onto an empty portal reads normally, so skip the pulse then.
+		if (IsSwapForce() && OtherPresent(foundSlot))
+		{
+			PulseRescan(foundSlot, /*physicalOnly=*/false);
+			cemuLog_log(LogType::Force,
+						"nsyshid::Skylander: OnPhysicalAdd -> portal re-scan pulse (Swap Force physical add)");
+		}
 	}
 
 	void SkylanderUSB::OnPhysicalRemove(uint8 portalIndex)
@@ -1257,5 +1277,48 @@ namespace nsyshid
 		}
 		cemuLog_log(LogType::Force,
 					"nsyshid::Skylander: OnPhysicalRemove portal {} -> no matching slot", portalIndex);
+	}
+
+	void SkylanderUSB::PulseRescan(uint8 exceptSlot, bool physicalOnly)
+	{
+		// Caller already holds m_skyMutex.
+		constexpr int kRemoveHold = 150; // poll samples to hold "absent" (~1.5-2s, matches a manual lift)
+		for (uint8 i = 0; i < 16; i++)
+		{
+			if (i == exceptSlot)
+				continue;
+			auto& other = m_skylanders[i];
+			if (!(other.status & 1))
+				continue;
+			if (physicalOnly && !other.physical)
+				continue;
+			other.status = Skylander::REMOVING;
+			other.queuedStatus.push(Skylander::REMOVING);
+			for (int h = 0; h < kRemoveHold; h++)
+				other.queuedStatus.push(Skylander::REMOVED);
+			other.queuedStatus.push(Skylander::ADDED);
+			other.queuedStatus.push(Skylander::READY);
+		}
+	}
+
+	bool SkylanderUSB::OtherPresent(uint8 exceptSlot) const
+	{
+		// Caller already holds m_skyMutex.
+		for (uint8 i = 0; i < MAX_SKYLANDERS; i++)
+		{
+			if (i == exceptSlot)
+				continue;
+			if (m_skylanders[i].status & 1)
+				return true;
+		}
+		return false;
+	}
+
+	bool SkylanderUSB::IsSwapForce() const
+	{
+		// Skylanders Swap Force has the region-independent unique id 0x1014 in the title-id low word
+		// (e.g. EUR 0x0005000010140400). Other Skylanders games have distinct unique ids.
+		const uint64 titleId = CafeSystem::GetForegroundTitleId();
+		return ((titleId >> 16) & 0xFFFF) == 0x1014;
 	}
 } // namespace nsyshid

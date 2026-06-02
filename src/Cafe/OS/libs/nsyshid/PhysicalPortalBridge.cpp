@@ -83,7 +83,13 @@ namespace nsyshid
 		cmd.bytes[2] = g;
 		cmd.bytes[3] = b;
 		std::lock_guard lock(m_outboxMutex);
-		m_outbox.push(cmd);
+		// Coalesce consecutive colour updates: only the latest colour matters, so replace a pending
+		// 'C' at the tail instead of stacking them. This bounds the queue when a game streams LED
+		// animation (Swap Force) and especially while forwarding is paused during a figure read.
+		if (!m_outbox.empty() && m_outbox.back().bytes[0] == 'C')
+			m_outbox.back() = cmd;
+		else
+			m_outbox.push(cmd);
 	}
 
 	void PhysicalPortalBridge::QueueCommand(const uint8* data, uint32 len)
@@ -112,8 +118,13 @@ namespace nsyshid
 		cmd.bytes[0] = 'Q';
 		cmd.bytes[1] = 0x10 | (portalIndex & 0x0F); // real portal read: high nibble 0x10 selects "read"
 		cmd.bytes[2] = block;
-		std::lock_guard lock(m_outboxMutex);
-		m_outbox.push(cmd);
+		// Send the read query DIRECTLY rather than through m_outbox. The outbox carries the game's
+		// LED ('C') / write ('W') commands, which some games (e.g. Swap Force) stream continuously
+		// during gameplay. A query queued behind that flood would not reach the portal before its
+		// QUERY_TIMEOUT_MS deadline (which starts the moment the query is issued), so block reads
+		// would time out and the whole figure read would loop forever without completing. Block
+		// reads must hit the wire immediately. Called on the bridge thread (Step), so this is safe.
+		SendControl(cmd.bytes.data(), static_cast<uint32>(cmd.bytes.size()));
 	}
 
 #ifdef HAS_LIBUSB
@@ -270,6 +281,20 @@ namespace nsyshid
 	{
 		// 1. Send at most ONE queued game command (LED / write) per step - the portal drops
 		//    commands sent in bursts, so everything to the portal is paced one-per-step.
+		//    While a figure is being read, PAUSE these: the game's commands share the portal with
+		//    the block-read queries, and an LED-heavy game (Swap Force) would otherwise starve the
+		//    read. A read takes ~1-2s; LED/write forwarding resumes the moment it finishes. Stale
+		//    colour updates are coalesced in SetColor so the queue does not balloon during the pause.
+		bool reading = false;
+		for (uint8 p = 0; p < 16; p++)
+		{
+			if (m_caching[p])
+			{
+				reading = true;
+				break;
+			}
+		}
+		if (!reading)
 		{
 			std::lock_guard lock(m_outboxMutex);
 			if (!m_outbox.empty())
@@ -448,12 +473,25 @@ namespace nsyshid
 			{
 				if (!m_present[p] && !m_caching[p])
 				{
-					// New arrival: begin caching. Step() issues the block reads one at a time.
+					// Begin (or RESUME) caching. Step() issues the block reads one at a time.
+					// We deliberately do NOT clear m_cacheGot here: if a previous attempt aborted on
+					// a single flaky block, the figure is still on the portal, so we resume and fetch
+					// only the blocks we are still missing instead of re-reading all 64 from scratch
+					// (which made reads very slow). The cache is cleared on actual removal below, so a
+					// fresh figure always starts clean. m_cacheStartMs is reset so each attempt gets a
+					// fresh whole-figure time budget.
+					uint8 got = 0;
+					for (uint8 b = 0; b < BLOCK_COUNT; b++)
+						if (m_cacheGot[p][b])
+							got++;
 					m_caching[p] = true;
-					m_cacheGot[p].fill(false);
-					m_cacheData[p].fill(0);
 					m_cacheStartMs[p] = NowMs();
-					cemuLog_log(LogType::Force, "nsyshid::PhysicalPortalBridge: figure arrived on slot {} - reading", p);
+					if (got == 0)
+						cemuLog_log(LogType::Force, "nsyshid::PhysicalPortalBridge: figure arrived on slot {} - reading", p);
+					else
+						cemuLog_log(LogType::Force,
+									"nsyshid::PhysicalPortalBridge: figure read resuming on slot {} ({}/{} blocks cached)",
+									p, got, BLOCK_COUNT);
 				}
 			}
 			else // not present
@@ -465,6 +503,10 @@ namespace nsyshid
 					if (m_queryActive && m_querySlot == p)
 						m_queryActive = false;
 				}
+				// Figure is off the portal: discard any cached blocks so the NEXT figure placed here
+				// starts a clean read (this is the only place the cache is reset).
+				m_cacheGot[p].fill(false);
+				m_cacheData[p].fill(0);
 				if (m_present[p])
 				{
 					m_present[p] = false;

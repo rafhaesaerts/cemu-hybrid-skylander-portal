@@ -113,6 +113,15 @@ namespace nsyshid
 		std::array<Skylander, MAX_SKYLANDERS> m_skylanders;
 
 	  private:
+		// Force a full portal re-scan by briefly pulsing present figures off-and-on, so a game
+		// that defers mid-session arrivals re-reads the whole portal. Caller holds m_skyMutex.
+		// `physicalOnly` limits the pulse to physical siblings; otherwise virtual siblings pulse too.
+		void PulseRescan(uint8 exceptSlot, bool physicalOnly);
+		// True when any figure other than `exceptSlot` is currently present. Caller holds m_skyMutex.
+		bool OtherPresent(uint8 exceptSlot) const;
+		// True when the running title is Skylanders Swap Force (any region).
+		bool IsSwapForce() const;
+
 		std::queue<std::array<uint8, 64>> m_queries;
 		bool m_activated = true;
 		uint8 m_interruptCounter = 0;
