@@ -26,11 +26,16 @@ namespace nsyshid
 		constexpr uint16 CTRL_VALUE = 0x0200;
 		constexpr uint16 CTRL_INDEX = 0x0000;
 		constexpr uint8 EP_INTERRUPT_IN = 0x81;
-		constexpr uint32 PACKET_SIZE = 32; // Skylander command/response packet size
+		constexpr uint32 PACKET_SIZE = 32;		 // Skylander command/response packet size
 		constexpr uint8 CACHE_MAX_RETRIES = 3;
 		constexpr uint64 QUERY_TIMEOUT_MS = 250; // wait this long for a block-read reply before retrying
-		constexpr uint64 CACHE_MAX_MS = 6000;    // give up reading a whole figure after this long
+		constexpr uint64 CACHE_MAX_MS = 6000;	 // give up reading a whole figure after this long
 		constexpr uint64 HANDSHAKE_PACE_MS = 60; // gap between paced startup commands
+		constexpr uint32 REOPEN_RETRY_MS = 1000; // how often to look for the portal after an unplug
+		// Transient (non-unplug) read errors in an unbroken streak before the device is
+		// treated as lost anyway. Each erroring read is paced ~2ms, so this is roughly half
+		// a second of solid failures - a single glitch never drops figures.
+		constexpr uint32 READ_ERROR_STREAK_LIMIT = 250;
 
 		// Render up to `len` bytes of `buf` as a hex string for diagnostic logging.
 		std::string HexDump(const uint8* buf, uint32 len)
@@ -77,19 +82,9 @@ namespace nsyshid
 
 	void PhysicalPortalBridge::SetColor(uint8 r, uint8 g, uint8 b)
 	{
-		OutCommand cmd;
-		cmd.bytes[0] = 'C';
-		cmd.bytes[1] = r;
-		cmd.bytes[2] = g;
-		cmd.bytes[3] = b;
-		std::lock_guard lock(m_outboxMutex);
-		// Coalesce consecutive colour updates: only the latest colour matters, so replace a pending
-		// 'C' at the tail instead of stacking them. This bounds the queue when a game streams LED
-		// animation (Swap Force) and especially while forwarding is paused during a figure read.
-		if (!m_outbox.empty() && m_outbox.back().bytes[0] == 'C')
-			m_outbox.back() = cmd;
-		else
-			m_outbox.push(cmd);
+		// Same path as the game's own LED commands so colour coalescing lives in one place.
+		const uint8 cmd[4] = {'C', r, g, b};
+		QueueCommand(cmd, sizeof(cmd));
 	}
 
 	void PhysicalPortalBridge::QueueCommand(const uint8* data, uint32 len)
@@ -98,6 +93,21 @@ namespace nsyshid
 		const uint32 n = std::min<uint32>(len, static_cast<uint32>(cmd.bytes.size()));
 		memcpy(cmd.bytes.data(), data, n);
 		std::lock_guard lock(m_outboxMutex);
+		if (cmd.bytes[0] == 'C')
+		{
+			// Remember the latest colour so it can be restored after a reconnect.
+			m_lastLedCmd = cmd;
+			m_hasLastLedCmd = true;
+			// Coalesce consecutive colour updates: only the latest colour matters, so replace
+			// a pending 'C' at the tail instead of stacking them. This bounds the queue when a
+			// game streams LED animation (Swap Force) and especially while forwarding is
+			// paused during a figure read. Never reorders relative to queued writes ('W').
+			if (!m_outbox.empty() && m_outbox.back().bytes[0] == 'C')
+			{
+				m_outbox.back() = cmd;
+				return;
+			}
+		}
 		m_outbox.push(cmd);
 	}
 
@@ -105,7 +115,7 @@ namespace nsyshid
 	{
 		OutCommand cmd;
 		cmd.bytes[0] = 'W';
-		cmd.bytes[1] = portalIndex; // VERIFY: real portal may expect (0x10 | portalIndex)
+		cmd.bytes[1] = portalIndex; // bare slot index ('W' | index | block | data16, hardware-validated)
 		cmd.bytes[2] = block;
 		memcpy(&cmd.bytes[3], data16, BLOCK_SIZE);
 		std::lock_guard lock(m_outboxMutex);
@@ -116,7 +126,7 @@ namespace nsyshid
 	{
 		OutCommand cmd;
 		cmd.bytes[0] = 'Q';
-		cmd.bytes[1] = 0x10 | (portalIndex & 0x0F); // real portal read: high nibble 0x10 selects "read"
+		cmd.bytes[1] = 0x10 | (portalIndex & 0x0F); // high nibble 0x10 selects "read" (hardware-validated)
 		cmd.bytes[2] = block;
 		// Send the read query DIRECTLY rather than through m_outbox. The outbox carries the game's
 		// LED ('C') / write ('W') commands, which some games (e.g. Swap Force) stream continuously
@@ -128,7 +138,7 @@ namespace nsyshid
 	}
 
 #ifdef HAS_LIBUSB
-	bool PhysicalPortalBridge::OpenDevice()
+	bool PhysicalPortalBridge::OpenDevice(bool logFailure)
 	{
 		libusb_context* ctx = nullptr;
 		const int initRc = libusb_init(&ctx);
@@ -141,10 +151,11 @@ namespace nsyshid
 			libusb_open_device_with_vid_pid(ctx, PORTAL_VID, PORTAL_PID);
 		if (!handle)
 		{
-			cemuLog_log(LogType::Force,
-							 "PhysicalPortalBridge::OpenDevice: portal {:04X}:{:04X} not found / not openable "
-							 "(needs WinUSB driver via Zadig)",
-							 PORTAL_VID, PORTAL_PID);
+			if (logFailure)
+				cemuLog_log(LogType::Force,
+								 "PhysicalPortalBridge::OpenDevice: portal {:04X}:{:04X} not found / not openable "
+								 "(needs WinUSB driver via Zadig)",
+								 PORTAL_VID, PORTAL_PID);
 			libusb_exit(ctx);
 			return false;
 		}
@@ -153,8 +164,9 @@ namespace nsyshid
 		const int claimRc = libusb_claim_interface(handle, 0);
 		if (claimRc != 0)
 		{
-			cemuLog_log(LogType::Force,
-							 "PhysicalPortalBridge::OpenDevice: claim_interface(0) failed ({})", claimRc);
+			if (logFailure)
+				cemuLog_log(LogType::Force,
+								 "PhysicalPortalBridge::OpenDevice: claim_interface(0) failed ({})", claimRc);
 			libusb_close(handle);
 			libusb_exit(ctx);
 			return false;
@@ -186,28 +198,44 @@ namespace nsyshid
 		const int r = libusb_control_transfer(
 			static_cast<libusb_device_handle*>(m_handle), CTRL_REQUEST_TYPE, CTRL_REQUEST,
 			CTRL_VALUE, CTRL_INDEX, const_cast<uint8*>(data), static_cast<uint16>(len), 1000);
+		if (r == LIBUSB_ERROR_NO_DEVICE)
+			m_deviceLost = true; // unplug noticed on the send path
 		return r >= 0;
 	}
 
 	int PhysicalPortalBridge::ReadInterrupt(uint8* buf, uint32 len, int timeoutMs)
 	{
 		if (!m_handle)
-			return -1;
+			return -2;
 		int transferred = 0;
 		const int r = libusb_interrupt_transfer(static_cast<libusb_device_handle*>(m_handle),
 												EP_INTERRUPT_IN, buf, static_cast<int>(len),
 												&transferred, timeoutMs);
 		if (r == 0)
+		{
+			m_readErrorStreak = 0;
 			return transferred;
+		}
 		if (r == LIBUSB_ERROR_TIMEOUT)
+		{
+			m_readErrorStreak = 0;
 			return 0;
+		}
+		if (r == LIBUSB_ERROR_NO_DEVICE || ++m_readErrorStreak >= READ_ERROR_STREAK_LIMIT)
+		{
+			m_deviceLost = true;
+			return -2;
+		}
+		// Transient error: unlike a timeout this returns instantly, so pace it here to keep
+		// the worker loop from spinning hot while the device misbehaves.
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		return -1;
 	}
 #else
-	bool PhysicalPortalBridge::OpenDevice() { return false; }
+	bool PhysicalPortalBridge::OpenDevice(bool) { return false; }
 	void PhysicalPortalBridge::CloseDevice() {}
 	bool PhysicalPortalBridge::SendControl(const uint8*, uint32) { return false; }
-	int PhysicalPortalBridge::ReadInterrupt(uint8*, uint32, int) { return -1; }
+	int PhysicalPortalBridge::ReadInterrupt(uint8*, uint32, int) { return -2; }
 #endif // HAS_LIBUSB
 
 	bool PhysicalPortalBridge::Start()
@@ -217,7 +245,22 @@ namespace nsyshid
 		if (!OpenDevice())
 			return false;
 
-		// The paced startup handshake (R / A / C) runs on the worker thread - see InitHandshake.
+		// Fresh session: forget any per-slot / query / outbox state from a previous run.
+		m_present.fill(false);
+		m_caching.fill(false);
+		for (auto& got : m_cacheGot)
+			got.fill(false);
+		m_queryActive = false;
+		m_deviceLost = false;
+		m_readErrorStreak = 0;
+		m_lastStatusLogged.fill(0xFF);
+		{
+			std::lock_guard lock(m_outboxMutex);
+			while (!m_outbox.empty())
+				m_outbox.pop();
+		}
+
+		// The paced startup handshake (R / A) runs on the worker thread - see InitHandshake.
 		m_connected.store(true);
 		m_running.store(true);
 		m_thread = std::thread(&PhysicalPortalBridge::ThreadMain, this);
@@ -238,7 +281,74 @@ namespace nsyshid
 	{
 		InitHandshake();
 		while (m_running.load())
+		{
+			if (m_deviceLost)
+				HandleDeviceLoss();
+			if (!m_connected.load())
+			{
+				if (!TryReopen())
+					continue; // still unplugged; TryReopen paced the retry
+			}
 			Step();
+		}
+	}
+
+	void PhysicalPortalBridge::HandleDeviceLoss()
+	{
+		cemuLog_log(LogType::Force,
+					"nsyshid::PhysicalPortalBridge: real portal disconnected - dropping its figures, "
+					"watching for it to return");
+		m_queryActive = false;
+		for (uint8 p = 0; p < SLOT_COUNT; p++)
+		{
+			m_caching[p] = false;
+			m_cacheGot[p].fill(false);
+			m_cacheData[p].fill(0);
+			if (m_present[p])
+			{
+				m_present[p] = false;
+				if (m_onRemove)
+					m_onRemove(p);
+			}
+		}
+		{
+			std::lock_guard lock(m_outboxMutex);
+			while (!m_outbox.empty())
+				m_outbox.pop();
+		}
+		CloseDevice();
+		m_connected.store(false);
+		m_deviceLost = false;
+		m_readErrorStreak = 0;
+	}
+
+	bool PhysicalPortalBridge::TryReopen()
+	{
+		if (!OpenDevice(/*logFailure*/ false))
+		{
+			// Portal still absent: wait out the retry interval in slices so Stop() stays snappy.
+			for (uint32 waited = 0; waited < REOPEN_RETRY_MS && m_running.load(); waited += 50)
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			return false;
+		}
+		m_connected.store(true);
+		cemuLog_log(LogType::Force, "nsyshid::PhysicalPortalBridge: real portal reconnected");
+		InitHandshake();
+		// The portal rebooted with its LED off; restore the game's current colour. Figures
+		// still on it re-add themselves via the status pushes that follow the handshake.
+		OutCommand led;
+		bool hasLed = false;
+		{
+			std::lock_guard lock(m_outboxMutex);
+			if (m_hasLastLedCmd)
+			{
+				led = m_lastLedCmd;
+				hasLed = true;
+			}
+		}
+		if (hasLed)
+			SendControl(led.bytes.data(), static_cast<uint32>(led.bytes.size()));
+		return true;
 	}
 
 	// Read and dispatch any interrupt packets that arrive within `ms`. Used to (a) pace the
@@ -252,12 +362,15 @@ namespace nsyshid
 			const int n = ReadInterrupt(buf, sizeof(buf), 10);
 			if (n > 0)
 				HandleIncoming(buf, static_cast<uint32>(n));
+			else if (n == -2)
+				std::this_thread::sleep_for(std::chrono::milliseconds(2)); // dead handle returns instantly
 		}
 	}
 
 	// The real portal drops commands sent back-to-back, so the startup sequence is paced:
-	// reset ('R'), activate ('A 01'), then light the LED ('C') so the user can see the bridge
-	// is live. A short drain after each command lets the portal process it and reply.
+	// reset ('R'), then activate ('A 01'). A short drain after each command lets the portal
+	// process it and reply. The LED is left to the game: its C/J/L commands are forwarded to
+	// the real portal, and the current colour is pushed on (re)connect so it matches at once.
 	void PhysicalPortalBridge::InitHandshake()
 	{
 		uint8 pkt[PACKET_SIZE] = {};
@@ -272,9 +385,27 @@ namespace nsyshid
 		SendControl(pkt, PACKET_SIZE);
 		DrainFor(HANDSHAKE_PACE_MS);
 
-		// LED colour is left to the game: its C/J/L commands are forwarded to the real portal,
-		// and StartHybrid pushes the current colour on connect so it matches immediately.
 		cemuLog_log(LogType::Force, "nsyshid::PhysicalPortalBridge: handshake complete (R/A sent)");
+	}
+
+	bool PhysicalPortalBridge::AnyCaching() const
+	{
+		for (uint8 p = 0; p < SLOT_COUNT; p++)
+		{
+			if (m_caching[p])
+				return true;
+		}
+		return false;
+	}
+
+	int PhysicalPortalBridge::NextMissingBlock(uint8 portalIndex) const
+	{
+		for (uint8 b = 0; b < BLOCK_COUNT; b++)
+		{
+			if (!m_cacheGot[portalIndex][b])
+				return b;
+		}
+		return -1;
 	}
 
 	void PhysicalPortalBridge::Step()
@@ -284,17 +415,8 @@ namespace nsyshid
 		//    While a figure is being read, PAUSE these: the game's commands share the portal with
 		//    the block-read queries, and an LED-heavy game (Swap Force) would otherwise starve the
 		//    read. A read takes ~1-2s; LED/write forwarding resumes the moment it finishes. Stale
-		//    colour updates are coalesced in SetColor so the queue does not balloon during the pause.
-		bool reading = false;
-		for (uint8 p = 0; p < 16; p++)
-		{
-			if (m_caching[p])
-			{
-				reading = true;
-				break;
-			}
-		}
-		if (!reading)
+		//    colour updates are coalesced in QueueCommand so the queue does not balloon meanwhile.
+		if (!AnyCaching())
 		{
 			std::lock_guard lock(m_outboxMutex);
 			if (!m_outbox.empty())
@@ -306,30 +428,24 @@ namespace nsyshid
 		}
 
 		// 2. If no block-read is outstanding, issue the next one for whichever figure is being
-		//    cached (one at a time - this is the key fix for reliable reads).
+		//    cached (one at a time - this is the key to reliable reads).
 		if (!m_queryActive)
 		{
-			for (uint8 p = 0; p < 16; p++)
+			for (uint8 p = 0; p < SLOT_COUNT; p++)
 			{
 				if (!m_caching[p])
 					continue;
-				int nextBlock = -1;
-				for (uint8 b = 0; b < BLOCK_COUNT; b++)
-				{
-					if (!m_cacheGot[p][b])
-					{
-						nextBlock = b;
-						break;
-					}
-				}
+				const int nextBlock = NextMissingBlock(p);
 				if (nextBlock < 0)
 					continue; // fully cached; completion handled in step 5
 				m_querySlot = p;
 				m_queryBlock = static_cast<uint8>(nextBlock);
 				m_queryRetries = 0;
 				m_queryActive = true;
+				RequestBlock(p, m_queryBlock);
+				// Deadline set AFTER the (blocking) send so the reply always gets the full
+				// window, even if the control transfer itself stalled for a while.
 				m_queryDeadlineMs = NowMs() + QUERY_TIMEOUT_MS;
-				RequestBlock(p, static_cast<uint8>(nextBlock));
 				break;
 			}
 		}
@@ -340,6 +456,8 @@ namespace nsyshid
 		const int n = ReadInterrupt(buf, sizeof(buf), 10);
 		if (n > 0)
 			HandleIncoming(buf, static_cast<uint32>(n));
+		if (m_deviceLost)
+			return; // ThreadMain drops the figures and starts watching for a reconnect
 
 		// 4. Retry / give up on the outstanding query if it timed out.
 		const uint64 now = NowMs();
@@ -348,13 +466,13 @@ namespace nsyshid
 			if (m_queryRetries < CACHE_MAX_RETRIES)
 			{
 				m_queryRetries++;
-				m_queryDeadlineMs = now + QUERY_TIMEOUT_MS;
 				RequestBlock(m_querySlot, m_queryBlock);
+				m_queryDeadlineMs = NowMs() + QUERY_TIMEOUT_MS;
 			}
 			else
 			{
 				// Could not read this block. Abort the figure WITHOUT injecting anything; a later
-				// status push will retry the whole read cleanly.
+				// status push will resume the read cleanly (already-cached blocks are kept).
 				const uint8 p = m_querySlot;
 				m_queryActive = false;
 				if (m_caching[p])
@@ -370,12 +488,12 @@ namespace nsyshid
 		// 4b. Bound the whole-figure read. A block can be answered "present but not readable"
 		//     indefinitely (figure half-on the portal, damaged tag, etc.); the per-block timeout
 		//     never fires in that case because replies keep arriving. Abort once the figure has
-		//     been caching too long; the next status push restarts the read cleanly.
-		for (uint8 p = 0; p < 16; p++)
+		//     been caching too long; the next status push resumes the read cleanly.
+		for (uint8 p = 0; p < SLOT_COUNT; p++)
 		{
 			if (!m_caching[p])
 				continue;
-			if (NowMs() - m_cacheStartMs[p] > CACHE_MAX_MS)
+			if (now - m_cacheStartMs[p] > CACHE_MAX_MS)
 			{
 				m_caching[p] = false;
 				if (m_queryActive && m_querySlot == p)
@@ -387,21 +505,12 @@ namespace nsyshid
 		}
 
 		// 5. Deliver any figure whose blocks are now all cached.
-		for (uint8 p = 0; p < 16; p++)
+		for (uint8 p = 0; p < SLOT_COUNT; p++)
 		{
 			if (!m_caching[p])
 				continue;
-			bool complete = true;
-			for (uint8 b = 0; b < BLOCK_COUNT; b++)
-			{
-				if (!m_cacheGot[p][b])
-				{
-					complete = false;
-					break;
-				}
-			}
-			if (!complete)
-				continue;
+			if (NextMissingBlock(p) >= 0)
+				continue; // still incomplete
 
 			m_caching[p] = false;
 			if (m_queryActive && m_querySlot == p)
@@ -451,22 +560,19 @@ namespace nsyshid
 			return;
 		// Log the status only when the status WORD (bytes 1..4) actually changes - byte 5 is a
 		// free-running counter, so comparing it would log every single packet.
+		if (std::memcmp(buf, m_lastStatusLogged.data(), m_lastStatusLogged.size()) != 0)
 		{
-			static std::array<uint8, 5> s_lastStatus{};
-			if (len >= 5 && std::memcmp(buf, s_lastStatus.data(), 5) != 0)
-			{
-				std::memcpy(s_lastStatus.data(), buf, 5);
-				cemuLog_log(LogType::Force, "nsyshid::PhysicalPortalBridge: status changed {}",
-								 HexDump(buf, 5));
-			}
+			std::memcpy(m_lastStatusLogged.data(), buf, m_lastStatusLogged.size());
+			cemuLog_log(LogType::Force, "nsyshid::PhysicalPortalBridge: status changed {}",
+							 HexDump(buf, 5));
 		}
 		// Status word: 2 bits per slot index, low bit = present, slot 0 in the lowest bits
-		// (mirrors SkylanderUSB::GetStatus). VERIFY against real hardware.
+		// (mirrors SkylanderUSB::GetStatus; layout validated against real hardware).
 		const uint32 status = static_cast<uint32>(buf[1]) |
 							  (static_cast<uint32>(buf[2]) << 8) |
 							  (static_cast<uint32>(buf[3]) << 16) |
 							  (static_cast<uint32>(buf[4]) << 24);
-		for (uint8 p = 0; p < 16; p++)
+		for (uint8 p = 0; p < SLOT_COUNT; p++)
 		{
 			const bool present = ((status >> (p * 2)) & 0x1) != 0;
 			if (present)
@@ -524,7 +630,7 @@ namespace nsyshid
 		const uint8 idxByte = buf[1];
 		const uint8 p = idxByte & 0xF; // reply index byte is 0x10|idx on success, idx on failure
 		const uint8 block = buf[2];
-		if (p >= 16 || block >= BLOCK_COUNT)
+		if (p >= SLOT_COUNT || block >= BLOCK_COUNT)
 			return;
 		if (!m_caching[p])
 			return;

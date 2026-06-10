@@ -100,10 +100,17 @@ namespace nsyshid
 
 		// Hybrid mode: merge a real Portal of Power's figures into these emulated slots.
 		// StartHybrid opens the bridge; if no real portal / no libusb it is a no-op and the
-		// portal stays purely emulated. OnPhysicalAdd/Remove are invoked by the bridge.
+		// portal stays purely emulated. OnPhysicalAdd/Remove are invoked by the bridge's
+		// worker thread. Start/StopHybrid may be called from any thread (GUI checkbox,
+		// backend attach): they serialize on m_hybridMutex, and m_bridge is published /
+		// retired / read only under m_skyMutex.
 		void StartHybrid();
 		void StopHybrid();
-		bool IsHybridActive() const { return m_bridge != nullptr; }
+		bool IsHybridActive()
+		{
+			std::lock_guard lock(m_skyMutex);
+			return m_bridge != nullptr;
+		}
 		void OnPhysicalAdd(uint8 portalIndex, const std::array<uint8, SKY_FIGURE_SIZE>& data);
 		void OnPhysicalRemove(uint8 portalIndex);
 
@@ -115,7 +122,9 @@ namespace nsyshid
 	  private:
 		// Force a full portal re-scan by briefly pulsing present figures off-and-on, so a game
 		// that defers mid-session arrivals re-reads the whole portal. Caller holds m_skyMutex.
-		// `physicalOnly` limits the pulse to physical siblings; otherwise virtual siblings pulse too.
+		// `physicalOnly` limits the pulse to physical siblings; otherwise virtual siblings pulse
+		// too. Pass an out-of-range exceptSlot (0xFF) to pulse every present figure, including a
+		// just-added one (used to mimic lift-and-replace of a lone new arrival).
 		void PulseRescan(uint8 exceptSlot, bool physicalOnly);
 		// True when any figure other than `exceptSlot` is currently present. Caller holds m_skyMutex.
 		bool OtherPresent(uint8 exceptSlot) const;
@@ -125,6 +134,10 @@ namespace nsyshid
 		std::queue<std::array<uint8, 64>> m_queries;
 		bool m_activated = true;
 		uint8 m_interruptCounter = 0;
+		// Serializes StartHybrid/StopHybrid against each other (GUI checkbox + backend attach).
+		std::mutex m_hybridMutex;
+		// Diagnostics: last status word logged by GetStatus (sentinel so the first poll logs).
+		uint32 m_lastStatusWordLogged = 0xFFFFFFFFu;
 		SkylanderLEDColor m_colorRight = {};
 		SkylanderLEDColor m_colorLeft = {};
 		SkylanderLEDColor m_colorTrap = {};

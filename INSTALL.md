@@ -55,12 +55,17 @@ Cemu reads the portal through a generic USB driver, so you swap its driver once 
 
 ## Step 3 — Turn on Hybrid mode in Cemu
 
-1. Start a Skylanders game in this Cemu build.
+> ⚠️ **Set this BEFORE starting the game.** The Hybrid switch only takes effect when a game
+> starts — toggling it while a game is running does nothing. Changed your mind mid-game?
+> Change the checkbox, then restart the game.
+
+1. Open this Cemu build (no game running yet).
 2. Top menu: **Tools → Emulated USB Devices**.
 3. Open the **Skylanders Portal** tab.
 4. Tick **☑ Hybrid (also use real portal)**.
    - That's the only box you need — Hybrid already includes the emulated portal.
-5. The real portal should **light up** within a second or two. That means it's connected. 🎉
+5. Start your Skylanders game. The real portal **lights up with the game's colours** once it's
+   running — that means it's connected. 🎉
 
 ---
 
@@ -71,6 +76,8 @@ Cemu reads the portal through a generic USB driver, so you swap its driver once 
   the real figure, exactly like on a console.
 - **Virtual figures:** in the same Skylanders Portal tab, click **Load** on any empty slot and pick
   a `.sky` dump.
+- **Unplugged the portal mid‑game?** No problem — plug it back in and the figures come back by
+  themselves within a few seconds.
 - **Both at once:** keep a figure on the portal **and** Load a dump — they all show up together.
 
 ---
@@ -79,7 +86,7 @@ Cemu reads the portal through a generic USB driver, so you swap its driver once 
 
 | Problem | Fix |
 |---|---|
-| Portal doesn't light up / figures ignored | Make sure it's **plugged in** and the LED can power on. Re‑check **Zadig** shows `1430 0150` on **WinUSB**. Toggle the **Hybrid** checkbox off and on. |
+| Portal doesn't light up / figures ignored | Make sure it's **plugged in** and the LED can power on. Re‑check **Zadig** shows `1430 0150` on **WinUSB**. Toggle the **Hybrid** checkbox off and on, then restart the game (the switch only applies at game launch). |
 | "A toy on the portal has a problem" | That's the game rejecting bad figure **data** — usually a corrupt `.sky` dump. Try a known‑good dump. (Physical figures are read directly and are fine.) |
 | Portal worked, then stopped after re‑plugging | Re‑open Zadig and confirm the driver is still **WinUSB** on `1430 0150`. |
 | Nothing in **Tools → Emulated USB Devices** | You're running normal Cemu, not this hybrid build. Launch `Cemu_release.exe` from the hybrid folder. |

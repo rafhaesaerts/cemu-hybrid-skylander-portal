@@ -683,16 +683,25 @@ namespace nsyshid
 		case 'C':
 		{
 			g_skyportal.SetLeds(0x01, buf[1], buf[2], buf[3]);
-			// Hybrid: mirror the LED command onto the real portal verbatim.
-			if (m_bridge)
-				m_bridge->QueueCommand(buf, length);
+			// Hybrid: mirror the LED command onto the real portal verbatim. m_bridge is
+			// published/retired under m_skyMutex (StartHybrid/StopHybrid), so hold it for the
+			// access - otherwise StopHybrid could destroy the bridge while we are inside it.
+			{
+				std::lock_guard lock(m_skyMutex);
+				if (m_bridge)
+					m_bridge->QueueCommand(buf, length);
+			}
 			break;
 		}
 		case 'J':
 		{
 			g_skyportal.SetLeds(buf[1], buf[2], buf[3], buf[4]);
-			if (m_bridge)
-				m_bridge->QueueCommand(buf, length);
+			// See 'C': m_bridge may only be touched under m_skyMutex.
+			{
+				std::lock_guard lock(m_skyMutex);
+				if (m_bridge)
+					m_bridge->QueueCommand(buf, length);
+			}
 			interruptResponse = {buf[0]};
 			break;
 		}
@@ -704,8 +713,12 @@ namespace nsyshid
 				side = 0x04;
 			}
 			g_skyportal.SetLeds(side, buf[2], buf[3], buf[4]);
-			if (m_bridge)
-				m_bridge->QueueCommand(buf, length);
+			// See 'C': m_bridge may only be touched under m_skyMutex.
+			{
+				std::lock_guard lock(m_skyMutex);
+				if (m_bridge)
+					m_bridge->QueueCommand(buf, length);
+			}
 			break;
 		}
 		case 'M':
@@ -890,25 +903,22 @@ namespace nsyshid
 				else
 					otherVirtualPresent = true;
 			}
-			// Swap Force defers ANY figure (physical or virtual) that arrives mid-session, so a
-			// virtual character loaded while another figure is active goes unread until a re-scan.
-			// For Swap Force, pulse whenever another figure is present; for other games keep the
-			// narrow Trap Team behavior (first virtual onto a physical only).
-			if (IsSwapForce())
-			{
-				if (physicalPresent || otherVirtualPresent)
-				{
-					PulseRescan(foundSlot, /*physicalOnly=*/false);
-					cemuLog_log(LogType::Force,
-								"nsyshid::Skylander: LoadSkylander -> portal re-scan pulse (Swap Force virtual load)");
-				}
-			}
-			else if (physicalPresent && !otherVirtualPresent)
+			// Swap Force (user-tested): a virtual load never needs a re-scan pulse - a figure
+			// loaded onto an empty portal is read instantly, and with another figure already
+			// present the game picks the new one up by itself. Other games keep the narrow
+			// Trap Team behavior (pulse only for the first virtual onto a physical).
+			if (!IsSwapForce() && physicalPresent && !otherVirtualPresent)
 			{
 				PulseRescan(foundSlot, /*physicalOnly=*/true);
 				cemuLog_log(LogType::Force,
 							"nsyshid::Skylander: LoadSkylander -> portal re-scan pulse (first virtual onto physical)");
 			}
+		}
+		else
+		{
+			cemuLog_log(LogType::Force,
+						"nsyshid::Skylander: LoadSkylander (virtual) -> no free slot (id {:08X})", skySerial);
+			return foundSlot;
 		}
 		uint16 skyType = (uint16)buf[0x10] | ((uint16)buf[0x11] << 8);
 		uint16 skyVariant = (uint16)buf[0x1C] | ((uint16)buf[0x1D] << 8);
@@ -930,6 +940,18 @@ namespace nsyshid
 			thesky.queuedStatus.push(0);
 			thesky.Save();
 			thesky.skyFile.reset();
+			if (thesky.physical)
+			{
+				// GUI-clearing a slot that mirrors a REAL figure: unmap it so the slot does not
+				// stay flagged as physical. The figure itself is still on the real portal, so
+				// it will not reappear until it is lifted and placed again (the bridge only
+				// reports arrivals).
+				thesky.physical = false;
+				cemuLog_log(LogType::Force,
+							"nsyshid::Skylander: RemoveSkylander -> slot {} mirrored a physical figure; "
+							"lift it off the real portal before placing it again",
+							skyNum);
+			}
 			cemuLog_log(LogType::Force, "nsyshid::Skylander: RemoveSkylander (virtual) -> slot {}", skyNum);
 			return true;
 		}
@@ -1044,6 +1066,12 @@ namespace nsyshid
 		}
 		else
 		{
+			// m_skylanders (status + queuedStatus) is owned by m_skyMutex, and the bridge
+			// worker (OnPhysicalAdd/Remove, PulseRescan) and GUI loads mutate those queues
+			// concurrently with this poll. m_queryMutex alone only guards m_queries, so the
+			// drain below must hold m_skyMutex too (lock order is queryMutex -> skyMutex;
+			// nothing takes them in the opposite nesting).
+			std::lock_guard skyLock(m_skyMutex);
 			uint32 status = 0;
 			uint8 active = 0x00;
 			if (m_activated)
@@ -1072,10 +1100,9 @@ namespace nsyshid
 			memcpy(&interruptResponse[1], &status, sizeof(status));
 
 			// Diagnostic: log the status WORD the game receives, but only when it changes.
-			static uint32 s_lastWord = 0xFFFFFFFFu;
-			if (status != s_lastWord)
+			if (status != m_lastStatusWordLogged)
 			{
-				s_lastWord = status;
+				m_lastStatusWordLogged = status;
 				cemuLog_log(LogType::Force,
 							"nsyshid::Skylander: GetStatus word -> {:08X} (active={})", status, active);
 			}
@@ -1115,39 +1142,51 @@ namespace nsyshid
 
 	void SkylanderUSB::StartHybrid()
 	{
-		if (m_bridge)
-			return;
+		// Serialize Start/Stop against each other: the GUI checkbox and the backend attach
+		// can both call in, from different threads.
+		std::lock_guard lifecycle(m_hybridMutex);
+		{
+			std::lock_guard lock(m_skyMutex);
+			if (m_bridge)
+				return;
+		}
 		cemuLog_log(LogType::Force, "nsyshid::Skylander: StartHybrid - opening real portal");
-		m_bridge = std::make_unique<PhysicalPortalBridge>();
-		m_bridge->SetCallbacks(
+		// Build and start the bridge WITHOUT holding m_skyMutex: Start spawns the worker,
+		// which may fire OnPhysicalAdd/Remove straight away - and those take m_skyMutex.
+		auto bridge = std::make_unique<PhysicalPortalBridge>();
+		bridge->SetCallbacks(
 			[this](uint8 portalIndex, const std::array<uint8, SKY_FIGURE_SIZE>& data) {
 				OnPhysicalAdd(portalIndex, data);
 			},
 			[this](uint8 portalIndex) { OnPhysicalRemove(portalIndex); });
-		if (!m_bridge->Start())
+		if (!bridge->Start())
 		{
 			// No real portal connected / libusb unavailable -> remain purely emulated.
 			cemuLog_log(LogType::Force,
 							 "nsyshid::Skylander: StartHybrid FAILED - real portal could not be opened "
 							 "(check it is plugged in and bound to WinUSB via Zadig)");
-			m_bridge.reset();
+			return;
 		}
-		else
-		{
-			cemuLog_log(LogType::Force, "nsyshid::Skylander: StartHybrid OK - bridge running");
-			// Immediately reflect the game's current LED colour so the real portal matches the
-			// emulated one on connect (rather than flashing a default colour).
-			m_bridge->SetColor(m_colorRight.red, m_colorRight.green, m_colorRight.blue);
-		}
+		cemuLog_log(LogType::Force, "nsyshid::Skylander: StartHybrid OK - bridge running");
+		std::lock_guard lock(m_skyMutex);
+		m_bridge = std::move(bridge);
+		// Immediately reflect the game's current LED colour so the real portal matches the
+		// emulated one on connect (rather than flashing a default colour).
+		m_bridge->SetColor(m_colorRight.red, m_colorRight.green, m_colorRight.blue);
 	}
 
 	void SkylanderUSB::StopHybrid()
 	{
-		if (m_bridge)
+		std::lock_guard lifecycle(m_hybridMutex);
+		std::unique_ptr<PhysicalPortalBridge> bridge;
 		{
-			m_bridge->Stop();
-			m_bridge.reset();
+			std::lock_guard lock(m_skyMutex);
+			bridge = std::move(m_bridge); // readers (all under m_skyMutex) see it gone from here
 		}
+		// Join the worker OUTSIDE m_skyMutex: it may be blocked inside OnPhysicalAdd/Remove
+		// waiting for that very lock while Stop() waits for the worker - a classic deadlock.
+		if (bridge)
+			bridge->Stop();
 	}
 
 	void SkylanderUSB::OnPhysicalAdd(uint8 portalIndex,
@@ -1189,15 +1228,8 @@ namespace nsyshid
 				cemuLog_log(LogType::Force,
 							"nsyshid::Skylander: OnPhysicalAdd portal {} -> slot {} REPLACED (id {:08X})",
 							portalIndex, i, serial);
-				// Swap Force ignores a figure that changes/arrives mid-session unless the whole
-				// portal is re-scanned. If another figure is already present, pulse it so the game
-				// re-reads the swapped figure.
-				if (IsSwapForce() && OtherPresent(i))
-				{
-					PulseRescan(i, /*physicalOnly=*/false);
-					cemuLog_log(LogType::Force,
-								"nsyshid::Skylander: OnPhysicalAdd -> portal re-scan pulse (Swap Force physical swap)");
-				}
+				// Swap Force: no re-scan pulse. The REMOVED->ADDED->READY cycle queued above is
+				// what a real lift-and-swap looks like, and the game follows it by itself.
 				return;
 			}
 		}
@@ -1245,16 +1277,11 @@ namespace nsyshid
 					"nsyshid::Skylander: OnPhysicalAdd portal {} -> slot {} ADDED (id {:08X})",
 					portalIndex, foundSlot, serial);
 
-		// Swap Force defers a figure that arrives mid-session (while a character is already
-		// active) and never queries that slot until a full portal re-scan. If another figure is
-		// already present, pulse it so the game re-reads the portal and finds this new physical
-		// figure. A lone first arrival onto an empty portal reads normally, so skip the pulse then.
-		if (IsSwapForce() && OtherPresent(foundSlot))
-		{
-			PulseRescan(foundSlot, /*physicalOnly=*/false);
-			cemuLog_log(LogType::Force,
-						"nsyshid::Skylander: OnPhysicalAdd -> portal re-scan pulse (Swap Force physical add)");
-		}
+		// Swap Force: no re-scan pulse on arrivals. Earlier builds pulsed here, but the apparent
+		// need traced back to a since-fixed bridge bug (block reads starved by the game's LED
+		// stream), not to the game deferring arrivals. A plain ADDED->READY is exactly what a
+		// real placement looks like. If a figure placed mid-session ever sits unread again,
+		// restore a PulseRescan(0xFF, /*physicalOnly=*/false) here for the empty-portal case.
 	}
 
 	void SkylanderUSB::OnPhysicalRemove(uint8 portalIndex)

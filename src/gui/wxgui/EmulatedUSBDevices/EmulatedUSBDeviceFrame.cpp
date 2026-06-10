@@ -87,8 +87,9 @@ wxPanel* EmulatedUSBDeviceFrame::AddSkylanderPage(wxNotebook* notebook)
 		const bool enabled = m_emulatePortalHybrid->IsChecked();
 		GetConfig().emulated_usb_devices.emulate_skylander_portal_hybrid = enabled;
 		GetConfigHandle().Save();
-		// Start/stop the real-portal bridge live so toggling works mid-session without a
-		// relaunch. StartHybrid is a no-op if libusb is unavailable or no real portal is found.
+		// Start/stop the bridge right away; note a RUNNING game does not pick this change up,
+		// so the switch effectively applies when the next game starts (see README). StartHybrid
+		// is a no-op if libusb is unavailable or no real portal is found.
 		if (enabled)
 			nsyshid::g_skyportal.StartHybrid();
 		else
